@@ -24,6 +24,7 @@ from typing import (
 )
 
 import pendulum
+from pendulum import Duration
 
 import dagster._check as check
 from dagster._annotations import PublicAttr, public
@@ -229,6 +230,7 @@ class TimeWindowPartitionsDefinition(
             ("end", PublicAttr[Optional[datetime]]),
             ("fmt", PublicAttr[str]),
             ("end_offset", PublicAttr[int]),
+            ("offset", PublicAttr[Duration]),
             ("cron_schedule", PublicAttr[str]),
         ],
     ),
@@ -279,6 +281,7 @@ class TimeWindowPartitionsDefinition(
         hour_offset: Optional[int] = None,
         day_offset: Optional[int] = None,
         cron_schedule: Optional[str] = None,
+        offset: Optional[Duration] = None
     ):
         check.opt_str_param(timezone, "timezone")
         timezone = timezone or "UTC"
@@ -309,15 +312,28 @@ class TimeWindowPartitionsDefinition(
                 "If cron_schedule argument is provided, then schedule_type, minute_offset, "
                 "hour_offset, and day_offset can't also be provided",
             )
+            if offset is not None:
+                assert not end_offset
+            else:
+                print('Warning, end_offset is deprecated, use offset instead')
+                offset = Duration(days=17)  # TODO approximate from cron_schedule
         else:
             if schedule_type is None:
                 check.failed("One of schedule_type and cron_schedule must be provided")
 
+            if offset is None:
+                offset = Duration(0)
+
+            assert not end_offset
+            assert not minute_offset
+            assert not hour_offset
+            assert not day_offset
+
             cron_schedule = cron_schedule_from_schedule_type_and_offsets(
                 schedule_type=schedule_type,
-                minute_offset=minute_offset or 0,
-                hour_offset=hour_offset or 0,
-                day_offset=day_offset or 0,
+                minute_offset=0,
+                hour_offset=0,
+                day_offset=0,
             )
 
         if not is_valid_cron_schedule(cron_schedule):
@@ -327,7 +343,7 @@ class TimeWindowPartitionsDefinition(
             )
 
         return super(TimeWindowPartitionsDefinition, cls).__new__(
-            cls, start_dt, timezone, end_dt, fmt, end_offset, cron_schedule
+            cls, start_dt, timezone, end_dt, fmt, 0, offset, cron_schedule
         )
 
     def get_current_timestamp(self, current_time: Optional[datetime] = None) -> float:
@@ -337,6 +353,13 @@ class TimeWindowPartitionsDefinition(
             else pendulum.now(self.timezone)
         ).timestamp()
 
+    def get_current_time(self, current_time: Optional[datetime] = None) -> datetime:
+        return (
+            pendulum.instance(current_time, tz=self.timezone)
+            if current_time
+            else pendulum.now(self.timezone)
+        )
+
     def get_num_partitions(
         self,
         current_time: Optional[datetime] = None,
@@ -345,27 +368,17 @@ class TimeWindowPartitionsDefinition(
         # Method added for performance reasons.
         # Fetching partition keys requires significantly more compute time to
         # string format datetimes.
-        current_timestamp = self.get_current_timestamp(current_time=current_time)
+        current_time = self.get_current_time(current_time=current_time)
 
-        partitions_past_current_time = 0
+        end = current_time + self.offset
+        if self.end:
+            end = min(end, self.end)
 
         num_partitions = 0
         for time_window in self._iterate_time_windows(self.start):
-            if self.end and time_window.end.timestamp() > self.end.timestamp():
+            if time_window.end > end:
                 break
-            if (
-                time_window.end.timestamp() <= current_timestamp
-                or partitions_past_current_time < self.end_offset
-            ):
-                num_partitions += 1
-
-                if time_window.end.timestamp() > current_timestamp:
-                    partitions_past_current_time += 1
-            else:
-                break
-
-        if self.end_offset < 0:
-            num_partitions += self.end_offset
+            num_partitions += 1
 
         return num_partitions
 
@@ -377,6 +390,8 @@ class TimeWindowPartitionsDefinition(
         # Method added for performance reasons, to only string format
         # partition keys included within the indices.
         current_timestamp = self.get_current_timestamp(current_time=current_time)
+
+        # TOBECONTINUED
 
         partitions_past_current_time = 0
         partition_keys = []
@@ -1019,19 +1034,25 @@ class DailyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
+        offset: Optional[Duration] = None,
     ):
         _fmt = fmt or DEFAULT_DATE_FORMAT
+
+        if offset is not None:
+            assert minute_offset == 0
+            assert hour_offset == 0
+            assert end_offset == 0
+        else:
+            offset = Duration(days=end_offset, hours=hour_offset, minutes=minute_offset)
 
         return super(DailyPartitionsDefinition, cls).__new__(
             cls,
             schedule_type=ScheduleType.DAILY,
             start=start_date,
             end=end_date,
-            minute_offset=minute_offset,
-            hour_offset=hour_offset,
             timezone=timezone,
             fmt=_fmt,
-            end_offset=end_offset,
+            offset=offset,
         )
 
 
@@ -1184,18 +1205,24 @@ class HourlyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
+        offset: Optional[Duration] = None,
     ):
         _fmt = fmt or DEFAULT_HOURLY_FORMAT_WITHOUT_TIMEZONE
+
+        if offset is not None:
+            assert minute_offset == 0
+            assert end_offset == 0
+        else:
+            offset = Duration(days=end_offset, hours=end_offset)
 
         return super(HourlyPartitionsDefinition, cls).__new__(
             cls,
             schedule_type=ScheduleType.HOURLY,
             start=start_date,
             end=end_date,
-            minute_offset=minute_offset,
             timezone=timezone,
             fmt=_fmt,
-            end_offset=end_offset,
+            offset=offset,
         )
 
 
@@ -1320,20 +1347,31 @@ class MonthlyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
+        offset: Optional[Duration] = None,
     ):
         _fmt = fmt or DEFAULT_DATE_FORMAT
+
+        if offset is not None:
+            assert minute_offset == 0
+            assert hour_offset == 0
+            assert day_offset == 0
+            assert end_offset == 0
+        else:
+            offset = Duration(
+                months=end_offset,
+                days=day_offset,
+                hours=hour_offset,
+                minutes=minute_offset
+            )
 
         return super(MonthlyPartitionsDefinition, cls).__new__(
             cls,
             schedule_type=ScheduleType.MONTHLY,
             start=start_date,
             end=end_date,
-            minute_offset=minute_offset,
-            hour_offset=hour_offset,
-            day_offset=day_offset,
             timezone=timezone,
             fmt=_fmt,
-            end_offset=end_offset,
+            offset=offset
         )
 
 
@@ -1468,20 +1506,31 @@ class WeeklyPartitionsDefinition(TimeWindowPartitionsDefinition):
         timezone: Optional[str] = None,
         fmt: Optional[str] = None,
         end_offset: int = 0,
+        offset: Optional[Duration] = None,
     ):
         _fmt = fmt or DEFAULT_DATE_FORMAT
+
+        if offset is not None:
+            assert minute_offset == 0
+            assert hour_offset == 0
+            assert day_offset == 0
+            assert end_offset == 0
+        else:
+            offset = Duration(
+                months=end_offset,
+                days=day_offset,
+                hours=hour_offset,
+                minutes=minute_offset
+            )
 
         return super(WeeklyPartitionsDefinition, cls).__new__(
             cls,
             schedule_type=ScheduleType.WEEKLY,
             start=start_date,
             end=end_date,
-            minute_offset=minute_offset,
-            hour_offset=hour_offset,
-            day_offset=day_offset,
             timezone=timezone,
             fmt=_fmt,
-            end_offset=end_offset,
+            offset=offset
         )
 
 
